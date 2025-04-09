@@ -28,14 +28,29 @@ from app.schema import (
     ToolChoice,
 )
 
-
 REASONING_MODELS = ["o1", "o3-mini"]
 
 
 class TokenCounter:
+    """
+    令牌计数器类，用于精确计算各种类型内容的token消耗
+
+    属性：
+        tokenizer: 用于编码文本的tokenizer实例
+    """
+
     # Token constants
-    BASE_MESSAGE_TOKENS = 4
-    FORMAT_TOKENS = 2
+    BASE_MESSAGE_TOKENS = 4  # 每条消息的基础token数
+    FORMAT_TOKENS = 2  # 消息格式的固定token开销
+
+    def __init__(self, tokenizer):
+        """初始化令牌计数器
+
+        参数：
+            tokenizer: 用于文本编码的tokenizer实例
+        """
+        self.tokenizer = tokenizer
+
     LOW_DETAIL_IMAGE_TOKENS = 85
     HIGH_DETAIL_TILE_TOKENS = 170
 
@@ -43,9 +58,6 @@ class TokenCounter:
     MAX_SIZE = 2048
     HIGH_DETAIL_TARGET_SHORT_SIDE = 768
     TILE_SIZE = 512
-
-    def __init__(self, tokenizer):
-        self.tokenizer = tokenizer
 
     def count_text(self, text: str) -> int:
         """Calculate tokens for a text string"""
@@ -169,11 +181,29 @@ class TokenCounter:
 
 
 class LLM:
-    _instances: Dict[str, "LLM"] = {}
+    """
+    LLM核心类，实现：
+    - 单例模式管理多个配置实例
+    - OpenAI/Azure API交互
+    - 智能token计数与限额管理
+
+    特性：
+        _instances: 维护不同配置的单例实例
+        client: 异步API客户端
+        token_counter: 令牌计数工具实例
+    """
+
+    _instances: Dict[str, "LLM"] = {}  # 单例模式实例存储
 
     def __new__(
         cls, config_name: str = "default", llm_config: Optional[LLMSettings] = None
     ):
+        """实现单例模式
+
+        参数：
+            config_name: 配置名称（默认'default'）
+            llm_config: 可选的自定义配置
+        """
         if config_name not in cls._instances:
             instance = super().__new__(cls)
             instance.__init__(config_name, llm_config)
@@ -183,7 +213,19 @@ class LLM:
     def __init__(
         self, config_name: str = "default", llm_config: Optional[LLMSettings] = None
     ):
-        if not hasattr(self, "client"):  # Only initialize if not already initialized
+        """初始化LLM实例配置
+
+        参数：
+            config_name: 配置名称，默认为'default'
+            llm_config: 可选的LLM配置对象，若未提供则使用全局配置
+
+        功能：
+            - 加载模型配置参数
+            - 初始化OpenAI/Azure客户端
+            - 创建令牌计数器实例
+            - 设置token使用统计
+        """
+        if not hasattr(self, "client"):
             llm_config = llm_config or config.llm
             llm_config = llm_config.get(config_name, llm_config["default"])
             self.model = llm_config.model
@@ -231,7 +273,16 @@ class LLM:
         return self.token_counter.count_message_tokens(messages)
 
     def update_token_count(self, input_tokens: int, completion_tokens: int = 0) -> None:
-        """Update token counts"""
+        """更新token使用统计
+
+        参数：
+            input_tokens: 本次请求的输入token数
+            completion_tokens: 本次请求的生成token数（默认为0）
+
+        日志记录：
+            - 实时统计累计token使用量
+            - 监控单次请求及总量消耗
+        """
         # Only track tokens if max_input_tokens is set
         self.total_input_tokens += input_tokens
         self.total_completion_tokens += completion_tokens
@@ -258,28 +309,45 @@ class LLM:
 
         return "Token limit exceeded"
 
+    async def _call_api(self, params):
+        return await self.client.chat.completions.create(**params)
+
+    async def call_api_with_detailed_error(self, params):
+        try:
+            return await self._call_api(params)
+        except Exception as e:
+            error_msg = str(e)
+            if "400" in error_msg:
+                print("API 400错误排查清单:")
+                print("1. 检查API密钥格式是否正确")
+                print("2. 检查模型名称是否正确")
+                print("3. 检查请求参数格式")
+                print("4. 原始错误信息:", error_msg)
+            elif "401" in error_msg:
+                print("认证失败，请检查API密钥")
+            elif "429" in error_msg:
+                print("请求频率过高，请降低请求速度或升级API配额")
+            raise e
+
     @staticmethod
     def format_messages(messages: List[Union[dict, Message]]) -> List[dict]:
-        """
-        Format messages for LLM by converting them to OpenAI message format.
+        """将消息列表转换为OpenAI兼容格式
 
-        Args:
-            messages: List of messages that can be either dict or Message objects
+        参数：
+            messages: 原始消息列表，支持字典或Message对象
 
-        Returns:
-            List[dict]: List of formatted messages in OpenAI format
+        返回：
+            List[dict]: 标准化后的消息列表
 
-        Raises:
-            ValueError: If messages are invalid or missing required fields
-            TypeError: If unsupported message types are provided
+        处理流程：
+            1. 转换Message对象为字典格式
+            2. 验证消息角色合法性
+            3. 处理base64图像数据
+            4. 过滤无效消息内容
 
-        Examples:
-            >>> msgs = [
-            ...     Message.system_message("You are a helpful assistant"),
-            ...     {"role": "user", "content": "Hello"},
-            ...     Message.user_message("How are you?")
-            ... ]
-            >>> formatted = LLM.format_messages(msgs)
+        异常：
+            ValueError: 消息角色无效或字段缺失
+            TypeError: 不支持的消息类型
         """
         formatted_messages = []
 
@@ -405,7 +473,7 @@ class LLM:
                 # Non-streaming request
                 params["stream"] = False
 
-                response = await self.client.chat.completions.create(**params)
+                response = await self.call_api_with_detailed_error(params)
 
                 if not response.choices or not response.choices[0].message.content:
                     raise ValueError("Empty or invalid response from LLM")
@@ -421,7 +489,7 @@ class LLM:
             self.update_token_count(input_tokens)
 
             params["stream"] = True
-            response = await self.client.chat.completions.create(**params)
+            response = await self.call_api_with_detailed_error(params)
 
             collected_messages = []
             completion_text = ""
@@ -516,9 +584,7 @@ class LLM:
             multimodal_content = (
                 [{"type": "text", "text": content}]
                 if isinstance(content, str)
-                else content
-                if isinstance(content, list)
-                else []
+                else content if isinstance(content, list) else []
             )
 
             # Add images to content
@@ -566,7 +632,7 @@ class LLM:
 
             # Handle non-streaming request
             if not stream:
-                response = await self.client.chat.completions.create(**params)
+                response = await self.call_api_with_detailed_error(params)
 
                 if not response.choices or not response.choices[0].message.content:
                     raise ValueError("Empty or invalid response from LLM")
@@ -576,7 +642,7 @@ class LLM:
 
             # Handle streaming request
             self.update_token_count(input_tokens)
-            response = await self.client.chat.completions.create(**params)
+            response = await self.call_api_with_detailed_error(params)
 
             collected_messages = []
             async for chunk in response:
@@ -701,7 +767,7 @@ class LLM:
                     temperature if temperature is not None else self.temperature
                 )
 
-            response = await self.client.chat.completions.create(**params)
+            response = await self.call_api_with_detailed_error(params)
 
             # Check if response is valid
             if not response.choices or not response.choices[0].message:
